@@ -226,6 +226,135 @@ let device_kind_of_backend_keys backend_keys =
   try Device_common.vbd_kind_of_string (List.assoc "backend-kind" backend_keys)
   with Not_found -> Device_common.Vbd !Xenopsd.default_vbd_backend_kind
 
+(* We store away the device name so we can lookup devices by name later *)
+let _device_id kind = Device_common.string_of_kind kind ^ "-id"
+
+(* Return the xenstore device with [kind] corresponding to [id]
+
+   This is an inefficient operation because xenstore indexes the devices by devid, not id,
+   so in order to find an id we need to go through potentially all the devids in the tree.
+
+   Therefore, we need to cache the results to decrease the overall xenstore read accesses.
+   During VM lifecycle operations, this cache will reduce xenstored read accesses from
+   O(n^2) to O(n), where n is the number of VBDs in a VM.
+*)
+
+module DeviceCache = struct
+  module PerVMCache = struct
+    include Hashtbl
+    let create n = (create n, Mutex.create ())
+  end
+  include Hashtbl
+  let create n = (create n, Mutex.create())
+  let discard (cache, mutex) domid = Mutex.execute mutex (fun () ->
+      debug "removing device cache for domid %d" domid;
+      remove cache domid
+    )
+  exception NotFoundIn of string option list
+  let get (cache, mutex) fetch_all_f fetch_one_f domid key =
+    let (domid_cache, domid_mutex) = Mutex.execute mutex (fun () ->
+        if mem cache domid then
+          find cache domid
+        else
+          let domid_cache = PerVMCache.create 16 in
+          debug "adding device cache for domid %d" domid;
+          replace cache domid domid_cache;
+          domid_cache
+      ) in
+    Mutex.execute domid_mutex (fun () ->
+        let refresh_cache () = (* expensive *)
+          PerVMCache.reset domid_cache;
+          List.iter (fun (k,v) -> PerVMCache.replace domid_cache k v) (fetch_all_f ())
+        in
+        (try
+           let cached_value = PerVMCache.find domid_cache (Some key) in
+           (* cross-check cached value with original value to verify it is up-to-date *)
+           let fetched_value = fetch_one_f cached_value in
+           if cached_value <> fetched_value then
+             ( (* force refresh of domid cache *)
+               refresh_cache ()
+             )
+         with _ -> (* attempt to refresh cache *)
+           (try refresh_cache () with _ -> ())
+        );
+        try
+          PerVMCache.find domid_cache (Some key)
+        with _ ->
+          let keys = try PerVMCache.fold (fun k v acc -> k::acc) domid_cache [] with _ -> [] in
+          raise (NotFoundIn keys)
+      )
+end
+
+
+let device_cache = DeviceCache.create 256
+
+let device_by_id xc xs vm kind domain_selection id =
+  match vm |> uuid_of_string |> domid_of_uuid ~xc ~xs domain_selection with
+  | None ->
+    debug "VM = %s; does not exist in domain list" vm;
+    raise (Does_not_exist("domain", vm))
+  | Some frontend_domid ->
+    let fetch_all_from_xenstore_f () = (* expensive *)
+      let devices = Device_common.list_frontends ~xs frontend_domid in
+      let key = _device_id kind in
+      let id_of_device device =
+        let path = Device_common.get_private_data_path_of_device device in
+        try Some (xs.Xs.read (Printf.sprintf "%s/%s" path key))
+        with _ -> None in
+      let ids = List.map id_of_device devices in
+      List.combine ids devices
+    in
+    let fetch_one_from_xenstore_f cached_device =
+      let cached_frontend_devid = cached_device.Device_common.frontend.Device_common.devid in
+      let xenstored_device = Device_common.list_frontends ~xs ~for_devids:[cached_frontend_devid] frontend_domid in
+      match xenstored_device with [] -> raise Not_found | x ::_ -> x
+    in
+    try DeviceCache.get device_cache fetch_all_from_xenstore_f fetch_one_from_xenstore_f frontend_domid id
+    with DeviceCache.NotFoundIn ids ->
+      debug "VM = %s; domid = %d; Device is not active: kind = %s; id = %s; active devices = [ %s ]" vm frontend_domid (Device_common.string_of_kind kind) id (String.concat ", " (List.map (Opt.default "None") ids));
+      raise (Device_not_connected)
+
+(* When we attach a VDI we remember the attach result so we can lookup
+       details such as the device-kind later. *)
+
+let vdi_attach_path vbd =
+  let open Vbd in
+  Printf.sprintf "/xapi/%s/private/vdis/%s" (fst vbd.id) (snd vbd.id)
+
+let device_kind_of_vbd ~xs vbd =
+  let open Vbd in
+
+  let _backend_kind = "backend-kind" in
+
+  (* If the user has provided an override then use that *)
+  if List.mem_assoc _backend_kind vbd.extra_backend_keys
+  then Device_common.kind_of_string (List.assoc _backend_kind vbd.extra_backend_keys)
+  else match (try Some(xs.Xs.read (vdi_attach_path vbd) |> Jsonrpc.of_string |> attached_vdi_of_rpc) with _ -> None) with
+    | None ->
+      (* An empty VBD has to be a CDROM: anything will do *)
+      Device_common.Vbd !Xenopsd.default_vbd_backend_kind
+    | Some vdi ->
+      let xenstore_data = vdi.attach_info.Storage_interface.xenstore_data in
+      (* Use the storage manager's preference *)
+      if List.mem_assoc _backend_kind xenstore_data
+      then Device_common.kind_of_string (List.assoc _backend_kind xenstore_data)
+      else Device_common.Vbd !Xenopsd.default_vbd_backend_kind
+
+let id_of_vbd vbd =
+  let open Vbd in
+  snd vbd.id
+
+let device_of_vbd xc xs vm vbd =
+ try
+   Some (device_by_id xc xs vm (device_kind_of_vbd ~xs vbd) Oldest (id_of_vbd vbd))
+ with
+ | (Does_not_exist(_,_)) ->
+   debug "VM = %s; VBD = %s; Ignoring missing domain" vm (id_of_vbd vbd);
+   None
+ | Device_not_connected ->
+   debug "VM = %s; VBD = %s; Ignoring missing device" vm (id_of_vbd vbd);
+   None
+
 let create_vbd_frontend ~xc ~xs task frontend_domid vdi =
   let frontend_vm_id = get_uuid ~xc frontend_domid |> Uuidm.to_string in
   let backend_vm_id = get_uuid ~xc vdi.domid |> Uuidm.to_string in
@@ -471,93 +600,6 @@ module Mem = struct
     Client.balance_memory dbg
 
 end
-
-(* We store away the device name so we can lookup devices by name later *)
-let _device_id kind = Device_common.string_of_kind kind ^ "-id"
-
-(* Return the xenstore device with [kind] corresponding to [id]
-
-   This is an inefficient operation because xenstore indexes the devices by devid, not id,
-   so in order to find an id we need to go through potentially all the devids in the tree.
-
-   Therefore, we need to cache the results to decrease the overall xenstore read accesses.
-   During VM lifecycle operations, this cache will reduce xenstored read accesses from
-   O(n^2) to O(n), where n is the number of VBDs in a VM.
-*)
-
-module DeviceCache = struct
-  module PerVMCache = struct
-    include Hashtbl
-    let create n = (create n, Mutex.create ())
-  end
-  include Hashtbl
-  let create n = (create n, Mutex.create())
-  let discard (cache, mutex) domid = Mutex.execute mutex (fun () ->
-      debug "removing device cache for domid %d" domid;
-      remove cache domid
-    )
-  exception NotFoundIn of string option list
-  let get (cache, mutex) fetch_all_f fetch_one_f domid key =
-    let (domid_cache, domid_mutex) = Mutex.execute mutex (fun () ->
-        if mem cache domid then
-          find cache domid
-        else
-          let domid_cache = PerVMCache.create 16 in
-          debug "adding device cache for domid %d" domid;
-          replace cache domid domid_cache;
-          domid_cache
-      ) in
-    Mutex.execute domid_mutex (fun () ->
-        let refresh_cache () = (* expensive *)
-          PerVMCache.reset domid_cache;
-          List.iter (fun (k,v) -> PerVMCache.replace domid_cache k v) (fetch_all_f ())
-        in
-        (try
-           let cached_value = PerVMCache.find domid_cache (Some key) in
-           (* cross-check cached value with original value to verify it is up-to-date *)
-           let fetched_value = fetch_one_f cached_value in
-           if cached_value <> fetched_value then
-             ( (* force refresh of domid cache *)
-               refresh_cache ()
-             )
-         with _ -> (* attempt to refresh cache *)
-           (try refresh_cache () with _ -> ())
-        );
-        try
-          PerVMCache.find domid_cache (Some key)
-        with _ ->
-          let keys = try PerVMCache.fold (fun k v acc -> k::acc) domid_cache [] with _ -> [] in
-          raise (NotFoundIn keys)
-      )
-end
-
-let device_cache = DeviceCache.create 256
-
-let device_by_id xc xs vm kind domain_selection id =
-  match vm |> uuid_of_string |> domid_of_uuid ~xc ~xs domain_selection with
-  | None ->
-    debug "VM = %s; does not exist in domain list" vm;
-    raise (Does_not_exist("domain", vm))
-  | Some frontend_domid ->
-    let fetch_all_from_xenstore_f () = (* expensive *)
-      let devices = Device_common.list_frontends ~xs frontend_domid in
-      let key = _device_id kind in
-      let id_of_device device =
-        let path = Device_common.get_private_data_path_of_device device in
-        try Some (xs.Xs.read (Printf.sprintf "%s/%s" path key))
-        with _ -> None in
-      let ids = List.map id_of_device devices in
-      List.combine ids devices
-    in
-    let fetch_one_from_xenstore_f cached_device =
-      let cached_frontend_devid = cached_device.Device_common.frontend.Device_common.devid in
-      let xenstored_device = Device_common.list_frontends ~xs ~for_devids:[cached_frontend_devid] frontend_domid in
-      match xenstored_device with [] -> raise Not_found | x ::_ -> x
-    in
-    try DeviceCache.get device_cache fetch_all_from_xenstore_f fetch_one_from_xenstore_f frontend_domid id
-    with DeviceCache.NotFoundIn ids ->
-      debug "VM = %s; domid = %d; Device is not active: kind = %s; id = %s; active devices = [ %s ]" vm frontend_domid (Device_common.string_of_kind kind) id (String.concat ", " (List.map (Opt.default "None") ids));
-      raise (Device_not_connected)
 
 (* Extra keys to store in VBD backends to allow us to deactivate VDIs: *)
 type backend = disk option [@@deriving rpc]
@@ -1020,6 +1062,32 @@ module VM = struct
         (fun () -> Device.Dm.stop ~xs ~qemu_domid domid) ();
       log_exn_continue "Error stoping vncterm, already dead ?"
         (fun () -> Device.PV_Vnc.stop ~xs domid) ();
+      let vbds = Xenops_server.VBD_DB.vbds vm.id in
+      debug "XXXX destroy_device_model VM has %d VBDs" (List.length vbds);
+      vbds
+      |> List.iter (fun vbd ->
+          begin match vbd.Xenops_interface.Vbd.backend with
+          | Some disk ->
+            begin match disk with
+              | Local s -> debug "XXXX destroy_device_model vbd disk Local %s" s
+              | VDI s -> debug "XXXX destroy_device_model vbd disk Local %s" s
+            end
+          | None -> debug "XXXX destroy_device_model vbd no disk"
+          end;
+          List.iter (function (k, v) -> debug "XXXX destroy_device_model vbd extra_backend_keys (%s, %s)" k v) vbd.Xenops_interface.Vbd.extra_backend_keys;
+          List.iter (function (k, v) -> debug "XXXX destroy_device_model vbd extra_private_keys (%s, %s)" k v) vbd.Xenops_interface.Vbd.extra_private_keys;
+          log_exn_continue "Error removing hotplug-status xenstore key"
+            (fun () ->
+               let device = device_of_vbd xc xs (vm.id) vbd in
+               match device with
+               | Some device ->
+                 let path = Hotplug.path_written_by_hotplug_scripts device in
+                 debug "XXXX destroy_device_model device removing %s" path;
+                 xs.Xs.rm path 
+               | None ->
+                 debug "XXXX destroy_device_model no device"
+            ) ()
+        )
       (* If qemu is in a different domain to storage, detach disks *)
     ) Oldest
 
@@ -2040,12 +2108,7 @@ let set_active_device path active =
 module VBD = struct
   open Vbd
 
-  let id_of vbd = snd vbd.id
-
-  (* When we attach a VDI we remember the attach result so we can lookup
-     	   details such as the device-kind later. *)
-
-  let vdi_attach_path vbd = Printf.sprintf "/xapi/%s/private/vdis/%s" (fst vbd.id) (snd vbd.id)
+  let id_of = id_of_vbd
 
   let attach_and_activate task xc xs frontend_domid vbd vdi =
     let attached_vdi = match vdi with
@@ -2092,23 +2155,6 @@ module VBD = struct
       Storage.epoch_end task sr vdi
     | _ -> ()
 
-  let _backend_kind = "backend-kind"
-
-  let device_kind_of ~xs vbd =
-    (* If the user has provided an override then use that *)
-    if List.mem_assoc _backend_kind vbd.extra_backend_keys
-    then Device_common.kind_of_string (List.assoc _backend_kind vbd.extra_backend_keys)
-    else match (try Some(xs.Xs.read (vdi_attach_path vbd) |> Jsonrpc.of_string |> attached_vdi_of_rpc) with _ -> None) with
-      | None ->
-        (* An empty VBD has to be a CDROM: anything will do *)
-        Device_common.Vbd !Xenopsd.default_vbd_backend_kind
-      | Some vdi ->
-        let xenstore_data = vdi.attach_info.Storage_interface.xenstore_data in
-        (* Use the storage manager's preference *)
-        if List.mem_assoc _backend_kind xenstore_data
-        then Device_common.kind_of_string (List.assoc _backend_kind xenstore_data)
-        else Device_common.Vbd !Xenopsd.default_vbd_backend_kind
-
   let vdi_path_of_device ~xs device = Device_common.backend_path_of_device ~xs device ^ "/vdi"
 
   let plug task vm vbd =
@@ -2126,7 +2172,7 @@ module VBD = struct
                  let k = "sm-data/" ^ k in
                  (k,v)::(List.remove_assoc k acc)) vbd.extra_backend_keys vdi.attach_info.Storage_interface.xenstore_data in
 
-             let kind = device_kind_of ~xs vbd in
+             let kind = device_kind_of_vbd ~xs vbd in
 
              (* Remember the VBD id with the device *)
              let vbd_id = _device_id kind, id_of vbd in
@@ -2205,16 +2251,7 @@ module VBD = struct
            let domid = domid_of_uuid ~xc ~xs Oldest (uuid_of_string vm) in
            (* If the device is gone then we don't need to shut it down but we do need
               					   to free any storage resources. *)
-           let device =
-             try
-               Some (device_by_id xc xs vm (device_kind_of ~xs vbd) Oldest (id_of vbd))
-             with
-             | (Does_not_exist(_,_)) ->
-               debug "VM = %s; VBD = %s; Ignoring missing domain" vm (id_of vbd);
-               None
-             | Device_not_connected ->
-               debug "VM = %s; VBD = %s; Ignoring missing device" vm (id_of vbd);
-               None in
+           let device = device_of_vbd xc xs vm vbd in
            let backend = match device with
              | None -> None
              | Some dv -> Device.Generic.get_private_key ~xs dv _vdi_id |> Jsonrpc.of_string |> backend_of_rpc in
@@ -2270,7 +2307,7 @@ module VBD = struct
          if not hvm
          then plug task vm { vbd with backend = Some disk }
          else begin
-           let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of ~xs vbd) Newest (id_of vbd) in
+           let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of_vbd ~xs vbd) Newest (id_of vbd) in
            let vdi = attach_and_activate task xc xs frontend_domid vbd (Some disk) in
            let phystype = Device.Vbd.Phys in
            (* We store away the disk so we can implement VBD.stat *)
@@ -2283,7 +2320,7 @@ module VBD = struct
   let eject task vm vbd =
     on_frontend
       (fun xc xs frontend_domid hvm ->
-         let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of ~xs vbd) Oldest (id_of vbd) in
+         let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of_vbd ~xs vbd) Oldest (id_of vbd) in
          Device.Vbd.media_eject ~xs device;
          safe_rm xs (vdi_path_of_device ~xs device);
          safe_rm xs (Device_common.backend_path_of_device ~xs device ^ "/sm-data");
@@ -2302,7 +2339,7 @@ module VBD = struct
          Opt.iter (function
              | Ionice qos ->
                try
-                 let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of ~xs vbd) Newest (id_of vbd) in
+                 let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of_vbd ~xs vbd) Newest (id_of vbd) in
                  let path = Device_common.kthread_pid_path_of_device ~xs device in
                  let kthread_pid = xs.Xs.read path |> int_of_string in
                  ionice qos kthread_pid
@@ -2336,7 +2373,7 @@ module VBD = struct
     with_xc_and_xs
       (fun xc xs ->
          try
-           let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of ~xs vbd) Newest (id_of vbd) in
+           let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of_vbd ~xs vbd) Newest (id_of vbd) in
            let qos_target = get_qos xc xs vm vbd device in
 
            let backend_present =
@@ -2361,7 +2398,7 @@ module VBD = struct
     with_xc_and_xs
       (fun xc xs ->
          try
-           let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of ~xs vbd) Newest (id_of vbd) in
+           let (device: Device_common.device) = device_by_id xc xs vm (device_kind_of_vbd ~xs vbd) Newest (id_of vbd) in
            if Hotplug.device_is_online ~xs device
            then begin
              let qos_target = get_qos xc xs vm vbd device in
